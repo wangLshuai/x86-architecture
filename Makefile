@@ -11,8 +11,8 @@ image: mbr.bin kernel.bin
 mbr.bin:mbr.asm
 	nasm -f bin mbr.asm -o mbr.bin
 
-kernel.bin:app.asm
-	nasm -f bin app.asm -o kernel.bin
+kernel.bin:app2.asm
+	nasm -f bin app2.asm -o kernel.bin
 
 .PHONY:clean
 clean:
