@@ -29,19 +29,27 @@ mov word [bx],ax ;15-0
 mov word [bx+2],0x8000
 
 mov byte [bx+4],0x0b
-
 xor al,al
 or al,0x02 ;低4位是type xewa ,读写
 or al,10010000b ;高四位设置段存在 特权0 数据段
 mov byte [bx+5],al
-
 xor al,al  ;低4位是段界限 16-19
 or al,01000000b ;高四位GBL(AVL)设置 粒度为字节,32位栈偏移寄存器esp,
 mov byte [bx+6],al
-
 mov byte [bx+7],0 ;段基址的24-31
 
-mov word [cs:gdt_size+0x7c00],25 ;gdtr 48位，高32位是gdt表起始地址，低16位是gdt边界。两个描述符，3*8-1
+;代码段别名段，一个可写的数据段
+add bx,8
+mov dword [bx],0x7c0001ff ;基地址0x7c00,界限512，32位尺寸，可读写，向上扩展数据段
+mov dword [bx+4],0x00409200
+
+;栈段4 ss = 4<<3
+add bx,8
+mov dword [bx],0x7c00fffe ;基地址0x7c00，界限0xffffe,4K,读写向下段，32位操作操作尺寸。下届是0x7c00+0xffffe*4k，上界是0x7c00+0xffffffff.下届是0x7c00+(0xffffffff-0xfffe*4k)=0x7c00+0xffffe000
+mov dword [bx+4],0x00cf9600
+
+
+mov word [cs:gdt_size+0x7c00],39 ;gdtr 48位，高32位是gdt表起始地址，低16位是gdt边界。两个描述符，5*8-1
 lgdt [cs:0x7c00+gdt_size]
 
 ; 打开20号地址线
@@ -55,17 +63,17 @@ mov eax,cr0
 or eax,0x01
 mov cr0,eax  ;使能保护模式;此时代码还使用实模式cs生成的在告诉描述符缓冲里的段描述符
 
-mov ax,1
-shl ax,4
-mov ds,ax   ;刷新ds的高速短描述符缓冲，数据段基址使用了gdt中的段描述符
-
-mov bx,0
-mov byte [bx],'a'
-
 jmp dword 0x0008:flush
 [bits 32]
-
 flush:
+    mov ax,1
+    shl ax,4
+    mov ds,ax   ;刷新ds的高速短描述符缓冲，数据段基址使用了gdt中的段描述符
+
+    mov ax,32
+    mov ss,ax
+    xor esp,esp ;向下增长的栈段
+
     mov byte [0x00],'P'  
     mov byte [0x02],'r'
     mov byte [0x04],'o'
@@ -75,27 +83,68 @@ flush:
     mov byte [0x0c],'t'
     mov byte [0x0e],' '
     mov byte [0x10],'m'
+
     mov byte [0x12],'o'
     mov byte [0x14],'d'
     mov byte [0x16],'e'
     mov byte [0x18],' '
     mov byte [0x1a],'O'
     mov byte [0x1c],'K'
-.idle:
+
+    mov eax,24
+    mov ds,eax  ;第三个段，代码段的别名，可读写
+    mov eax,16
+    mov es,eax
+    mov ecx,gdt_size-string
+    xor ebx,ebx
+L1:
+    mov byte dx,[ebx+string]
+    mov byte [es:160+ebx*2],dl
+    inc ebx
+    loop L1
+
+
+    ;【sp】 位计数exc 【sp+4】最大字符的索引,【sp+6】,最大字符的值
+    sub esp,8
+    mov ecx,gdt_size-string-1
+for1 
+    mov byte ax,[string]  ;第一个字符最大
+    mov [esp+6],al       
+    mov word [esp+4],0         ;最大字符索引
+    mov [esp],ecx         
+
+    xor bx,bx   ;循环ecx 次，bx 是0-ecx-1
+for2:
+    mov byte eax,[string+bx]
+    mov byte edx,[esp+6]
+    cmp al,dl
+    jna L2
+    mov byte [esp+6],al ;字符大于缓存的，记录字符的值和字符的索引
+    mov [esp+4],bx
+L2:
+    inc bx
+    loop for2
+
+    mov ecx,[esp]
+    mov bx,[esp+4]
+    mov byte eax,[string+ecx-1]
+    xchg [string+bx],al
+    mov [string+ecx-1],al
+    loop for1
+
+    xor ebx,ebx
+    mov ecx,gdt_size-string
+L3:
+    mov byte dx,[ebx+string]
+    mov byte [es:320+ebx*2],dl
+    inc ebx
+    loop L3
+    
+idle:
     hlt
-    jmp .idle
+    jmp idle
 
-;得到光标
-
-
-
-
-
-
-
-
-
-
+string db 's0ke4or92xap3fv8giuzjcy5l1m7hd6bnqtw.'
 
 
 gdt_size: dw 0
