@@ -38,16 +38,15 @@ or al,01000000b ;高四位GBL(AVL)设置 粒度为字节,32位栈偏移寄存器
 mov byte [bx+6],al
 mov byte [bx+7],0 ;段基址的24-31
 
-;代码段别名段，一个可写的数据段
+;3数据段 0-4G
 add bx,8
-mov dword [bx],0x7c0001ff ;基地址0x7c00,界限512，32位尺寸，可读写，向上扩展数据段
-mov dword [bx+4],0x00409200
+mov dword [bx],0x0000ffff ;基地址0,界限fffff，32位尺寸，可读写，向下扩展数据段
+mov dword [bx+4],0x00cf9200
 
 ;栈段4 ss = 4<<3
 add bx,8
 mov dword [bx],0x7c00fffe ;基地址0x7c00，界限0xffffe,4K,读写向下段，32位操作操作尺寸。下届是0x7c00+0xffffe*4k，上界是0x7c00+0xffffffff.下届是0x7c00+(0xffffffff-0xfffe*4k)=0x7c00+0xffffe000
 mov dword [bx+4],0x00cf9600
-
 
 mov word [cs:gdt_size+0x7c00],39 ;gdtr 48位，高32位是gdt表起始地址，低16位是gdt边界。两个描述符，5*8-1
 lgdt [cs:0x7c00+gdt_size]
@@ -98,7 +97,7 @@ flush:
     mov ecx,gdt_size-string
     xor ebx,ebx
 L1:
-    mov byte dx,[ebx+string]
+    mov byte dx,[ebx+string+0x7c00]
     mov byte [es:160+ebx*2],dl
     inc ebx
     loop L1
@@ -108,14 +107,14 @@ L1:
     sub esp,8
     mov ecx,gdt_size-string-1
 for1 
-    mov byte ax,[string]  ;第一个字符最大
+    mov byte ax,[string+0x7c00]  ;第一个字符最大
     mov [esp+6],al       
     mov word [esp+4],0         ;最大字符索引
     mov [esp],ecx         
 
     xor bx,bx   ;循环ecx 次，bx 是0-ecx-1
 for2:
-    mov byte eax,[string+bx]
+    mov byte eax,[string+0x7c00+bx]
     mov byte edx,[esp+6]
     cmp al,dl
     jna L2
@@ -127,15 +126,15 @@ L2:
 
     mov ecx,[esp]
     mov bx,[esp+4]
-    mov byte eax,[string+ecx-1]
-    xchg [string+bx],al
-    mov [string+ecx-1],al
+    mov byte eax,[string+0x7c00+ecx-1]
+    xchg [string+0x7c00+bx],al
+    mov [string+0x7c00+ecx-1],al
     loop for1
 
     xor ebx,ebx
     mov ecx,gdt_size-string
 L3:
-    mov byte dx,[ebx+string]
+    mov byte dx,[ebx+string+0x7c00]
     mov byte [es:320+ebx*2],dl
     inc ebx
     loop L3
