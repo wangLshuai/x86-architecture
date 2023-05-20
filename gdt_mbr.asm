@@ -1,3 +1,5 @@
+core_base_address equ 0x00040000  ;内核加载地址,第252k
+core_start_sector equ 0x00000001  ;内核在硬盘上第1扇区
 mov ax,cs
 mov ss,ax
 mov sp,0x7c00
@@ -65,85 +67,151 @@ mov cr0,eax  ;使能保护模式;此时代码还使用实模式cs生成的在告
 jmp dword 0x0008:flush
 [bits 32]
 flush:
-    mov ax,1
-    shl ax,4
-    mov ds,ax   ;刷新ds的高速短描述符缓冲，数据段基址使用了gdt中的段描述符
-
     mov ax,32
     mov ss,ax
     xor esp,esp ;向下增长的栈段
 
-    mov byte [0x00],'P'  
-    mov byte [0x02],'r'
-    mov byte [0x04],'o'
-    mov byte [0x06],'t'
-    mov byte [0x08],'e'
-    mov byte [0x0a],'c'
-    mov byte [0x0c],'t'
-    mov byte [0x0e],' '
-    mov byte [0x10],'m'
+    mov eax,0x0018 ;数据段3
+    mov ds,ax
 
-    mov byte [0x12],'o'
-    mov byte [0x14],'d'
-    mov byte [0x16],'e'
-    mov byte [0x18],' '
-    mov byte [0x1a],'O'
-    mov byte [0x1c],'K'
+    mov edi,core_base_address
+    mov eax,core_start_sector
+    mov ebx,edi
+    call read_hard_disk_0
 
-    mov eax,24
-    mov ds,eax  ;第三个段，代码段的别名，可读写
-    mov eax,16
-    mov es,eax
-    mov ecx,gdt_size-string
-    xor ebx,ebx
-L1:
-    mov byte dx,[ebx+string+0x7c00]
-    mov byte [es:160+ebx*2],dl
-    inc ebx
-    loop L1
+    mov eax,[edi]   ;core_length
+    xor edx,edx
+    mov ecx,512
+    div ecx
 
+    or edx,edx
+    jnz @1     ;edx 1=0 ,有余数 ，跳转
+    dec eax
+@1:
+    or eax,eax
+    jz setup    ;eax 为0，不需要继续读
 
-    ;【sp】 位计数exc 【sp+4】最大字符的索引,【sp+6】,最大字符的值
-    sub esp,8
-    mov ecx,gdt_size-string-1
-for1 
-    mov byte ax,[string+0x7c00]  ;第一个字符最大
-    mov [esp+6],al       
-    mov word [esp+4],0         ;最大字符索引
-    mov [esp],ecx         
+    ;读剩余扇区
+    mov ecx,eax
+    mov eax,core_start_sector
+    inc eax
+@2:
+    call read_hard_disk_0
+    inc eax
+    loop @2
 
-    xor bx,bx   ;循环ecx 次，bx 是0-ecx-1
-for2:
-    mov byte eax,[string+0x7c00+bx]
-    mov byte edx,[esp+6]
-    cmp al,dl
-    jna L2
-    mov byte [esp+6],al ;字符大于缓存的，记录字符的值和字符的索引
-    mov [esp+4],bx
-L2:
-    inc bx
-    loop for2
+setup:
+    mov esi,[0x7c00+gdt_base]        ;gdt
 
-    mov ecx,[esp]
-    mov bx,[esp+4]
-    mov byte eax,[string+0x7c00+ecx-1]
-    xchg [string+0x7c00+bx],al
-    mov [string+0x7c00+ecx-1],al
-    loop for1
+    ;建立公用例程段描述符
+    mov eax,[edi+0x04]  ;公用例程段汇编地址
+    mov ebx,[edi+0x08]  ;core_data_seg 汇编地址
+    sub ebx,eax
+    dec ebx             ;公用例程段界限
+    add eax,edi         ;公用例程段内存地址
+    mov ecx,0x00409800  ;32位尺度，p存在，0特权级别，s数据段或代码段,只执行代码段
+    call make_gdt_descriptor
+    mov [esi+5*8],eax   ;第5个描述符
+    mov [esi+5*8+4],edx
 
-    xor ebx,ebx
-    mov ecx,gdt_size-string
-L3:
-    mov byte dx,[ebx+string+0x7c00]
-    mov byte [es:320+ebx*2],dl
-    inc ebx
-    loop L3
-    
+    ;建立内核数据段描述符
+    mov eax,[edi+0x08]
+    mov ebx,[edi+0x0c]
+    sub ebx,eax         ;段长度
+    dec ebx
+    add eax,edi
+    mov ecx,0x00409200
+    call make_gdt_descriptor
+    mov [esi+6*8],eax
+    mov [esi+6*8+4],edx
+
+    ;建立core_code代码段描述符
+    mov eax,[edi+0x0c]
+    mov ebx,[edi]
+    sub ebx,eax         ;core_code长度
+    dec ebx             ;界限
+    add eax,edi
+    mov ecx,0x00409800
+    call make_gdt_descriptor
+    mov [esi+7*8],eax
+    mov [esi+7*8+4],edx
+
+    mov word [0x7c00+gdt_size],8*8-1
+    lgdt [0x7c00+gdt_size]
+    call far [edi+0x10]
 idle:
     hlt
     jmp idle
 
-string db 's0ke4or92xap3fv8giuzjcy5l1m7hd6bnqtw.'
+read_hard_disk_0:  ;从主硬盘读取一个逻辑扇区 输入EAX:为硬盘逻辑扇区，DS:EBX内存缓冲区，返回：EBX=EBX+512
+    push eax
+    push ecx
+    push edx
+
+    push eax
+    mov dx,0x1f2
+    mov al,1
+    out dx,al        ;操作一个扇区
+
+    inc dx          ;0x1f3
+    pop eax
+    out dx,al       ;LBA 地址7-0,总共有28位逻辑扇区编号
+
+    inc dx          ;0x1f4
+    shr eax,8       
+    out dx,al       ;LBA 8-15
+
+
+    inc dx          ;0x1f5
+    shr eax,8
+    out dx,al       ;LBA 16-23
+
+    inc dx          ;0x1f6
+    shr eax,8
+    or al,0xe0      ; LBA28模式，主盘。LBA 24-27位
+
+    inc dx          ;0x1f7
+    mov al,0x20
+    out dx,al       ;读取命令
+
+.waits:
+    in al,dx
+    and al,0x88
+    cmp al,0x08
+    jnz .waits       ;不相等则忙碌，等待数据准备好
+
+    mov ecx,256
+    mov dx,0x1f0    ;硬盘io输入端口号
+
+.readw:
+    in ax,dx
+    mov [ebx],ax
+    add ebx,2
+    loop .readw
+
+    pop edx
+    pop ecx
+    pop eax
+    ret
+
+make_gdt_descriptor:       ;输入EAX 线性地址，段的基地址，EBX 界限，ECX属性，返回EDX:EAX 段描述符
+    mov edx,eax
+    shl eax,16
+    or ax,bx       ;eax是8字节段描述符的低4字节，高16位是段基地址的0-15位，低16位是界限符的0-15位
+
+    ;配置段描述符的高4字节，存放在edx寄存器中
+    and edx,0xffff0000
+    rol edx,8   ;段基地址的24-31位在0-7,16-23在24-31位
+    bswap edx   ;交换高和低地址数据24-31位在24-31位，16-23位在0-7位
+
+    xor bx,bx   ;ebx 段界限，16-19位
+    or edx,ebx
+
+    or edx,ecx  ;属性，8-11，type;12-15 p dpl s;20-23,p d/b avl l
+    ret
+
+
+
 
 
 gdt_size: dw 0
