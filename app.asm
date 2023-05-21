@@ -1,187 +1,70 @@
 SECTION header vstart=0
-program_length:
-    dd program_end
-code_entry:
-    dw start ;[0x04]
-    dd section.code_1.start ;[0x06]
-realloc_tbl_len:
-    dw (header_end-code_1_segment)/4 ;[0x0a]
+    program_length  dd program_end ;0x00
+    head_len        dd header_end     ;0x04
 
+    stack_seg   dd 0                ;0x08
+    stack_len   dd 1                ;0x0c
 
-code_1_segment dd section.code_1.start ;[0x0c]
-code_2_segment dd section.code_2.start ;[0x10]
-data_1_segment dd section.data_1.start
-data_2_segment dd section.data_2.start
-stack_segment  dd section.stack.start
+    prgentry    dd start            ;程序入口0x10
+    code_seg    dd section.code.start   ;代码段汇编地址 0x14
+    code_len    dd code_end         ;代码段长度,0x18
+
+    data_seg    dd section.data.start;数据段汇编位置，0x1c
+    data_len    dd data_end           ;0x20
+
+;---------------------------------------------------------------------
+    ;导入符号表，需要重定位
+    salt_items dd (header_end-salt)/256 ;0x24
+    salt:
+    PrintString db '@PrintString'
+        times 256-($-PrintString) db 0
+
+    TerminateProgram db '@TerminateProgram'
+        times 256-($-TerminateProgram) db 0
+
+    ReadDiskData db '@ReadDiskData'
+        times 256-($-ReadDiskData) db 0
 
 header_end:
 
+SECTION data vstart=0
+    buffer times 1024 db 0 ;缓冲区
+    message_1           db 0x0d,0x0a,0x0d,0x0a
+                        db '****************User program is running***********'
+                        db 0x0d,0x0a,0
+    message_2           db '  Disk data:',0x0d,0x0a,0
 
-SECTION code_1 align=16 vstart=0
-put_string:
-    mov cl,[bx]
-    or cl,cl
-    jz .exit   ;[bx] 为0退出过程
-    call put_char
-    inc bx
-    jmp put_string
+data_end:
 
-    .exit:
-    ret
-; 显示一个字符，cl ascii
-put_char:
-    push ax
-    push bx
-    push cx
-    push dx
-    push ds
-    push es
+[bits 32]
 
-;光标位置 高8位
-    mov dx,0x3d4
-    mov al,0x0e
-    out dx,al
-    mov dx,0x3d5
-    in al,dx
-    mov ah,al
-;低8位
-    mov dx,0x3d4
-    mov al,0x0f
-    out dx,al
-    mov dx,0x3d5
-    in al,dx
-    mov bx,ax
-
-    cmp cl,0x0d  ;回车符?
-    jnz .put_0a  ;不是
-    mov ax,bx    ;bx 是光标位置 小于25*80
-    mov bl,80
-    div bl       ;ax = ax/bl ;结果小于25，小于256，高字节为0
-    mul bl       ;ax = al*bl
-    mov bx,ax    ;ax = ax/80 *80
-    jmp .set_cursor
-
-.put_0a:
-    cmp cl,0x0a ;换行符
-    jnz .put_other ;不是
-    add bx,80
-    jmp .roll_screen
-
-.put_other:
-    mov ax,0xb800
-    mov es,ax
-    shl bx,1
-    mov [es:bx],cl
-
-    shr bx,1
-    add bx,1
-
-.roll_screen:
-    cmp bx,2000 ;光标超出屏幕？
-    jl .set_cursor 
-
-    mov ax,0xb800
-    mov ds,ax
-    mov es,ax
-    cld
-    mov si,0xa0
-    mov di,0x00
-    mov cx,1920
-    rep movsw
-    push bx
-    mov bx,3840
-    mov cx,80
-.cls:
-    mov word [es:bx],0x0720
-    add bx,2
-    loop .cls
-    pop bx
-    sub bx,80
-.set_cursor:
-    mov dx,0x3d4
-    mov al,0x0e
-    out dx,al
-    mov dx,0x3d5
-    mov al,bh
-    out dx,al
-    mov dx,0x3d4
-    mov al,0x0f
-    out dx,al
-    mov dx,0x3d5
-    mov al,bl
-    out dx,al
-
-    pop es
-    pop ds
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
-
+SECTION code vstart=0
 start:
-    mov ax,[stack_segment]
-    mov ss,ax
-    mov sp,stack_end
+    mov eax,ds
+    mov fs,eax
 
-    mov ax,[data_1_segment]
-    mov ds,ax
+    mov eax,[stack_seg]
+    mov ss,eax
+    mov esp,0
 
-    mov bx,msg0  ;ds:bx是string地址 
-    call put_string
-    
-    mov ax, [es:code_2_segment]   ;code2 在内存中的段地址
-    mov [es:code_2_segment+2],ax
-    mov word [es:code_2_segment],begin
-    call far [es:code_2_segment]
+    mov eax,[data_seg]
+    mov ds,eax
 
-    retf    ;自动pop ip pop cs
-continue:
-    mov ax, [es:data_2_segment]
-    mov ds,ax
-    mov bx,msg1
-    call put_string
+    mov ebx,message_1
+    call far[fs:PrintString]
 
-    retf
+    mov eax,100
+    mov ebx,buffer
+    call far [fs:ReadDiskData]
 
+    mov ebx,message_2
+    call far [fs:PrintString]
 
-SECTION code_2 align=16 vstart=0
+    mov ebx,buffer
+    call far [fs:PrintString]
 
-    begin:
-        push word [es:code_1_segment]
-        mov ax,continue
-        push ax
-        retf   ;pop ip pop cs ; code_1_segment:continue
-SECTION data_1 align=16 vstart=0
+    jmp far [fs:TerminateProgram]
+code_end:
 
-    msg0 db ' This is NASM - the famous Netwide Assembler. '
-         db 'Back at SourceForge and in intensive development! '
-         db 'Get the current versions from http://www.nasmi.us/.'
-         db 0x0d,0x0a,0x0d,0x0a
-         db ' Example code fro cacluate 1+2+...+1000:',0x0d,0x0d,0x0a
-         db ' xor dx,dx',0x0d,0x0a
-         db ' xor ax,ax',0x0d,0x0a
-         db ' xor cx,cx',0x0d,0x0a
-         db ' @@:',0x0d,0x0a
-         db '   inc cx',0x0d,0x0a
-         db '   add ax,cx',0x0d,0x0a
-         db '   adc dx,0',0x0d,0x0a
-         db '   cmp cx,1000',0x0d,0x0a
-         db '   jle @@',0x0d,0x0a
-         db '   ... ...       (Some other codes)',0x0a,0x0a,0x0a,0x0a
-         db 0
-    
-SECTION data_2 align=16 vstart=0
-    msg1 db '  The above contents is written by leechung.'
-         db '20230513',0x0a,0x0a
-        
-SECTION stack align=16 vstart=0
-    resb 256 ;
-stack_end:
-
-
-SECTION trail align=16
+SECTION program_trail 
 program_end:
-
-
-
