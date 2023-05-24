@@ -63,7 +63,7 @@ start:
     mov ebx,buffer
     call far [fs:PrintString]
 
-    jmp far [fs:TerminateProgram]
+    call far [fs:TerminateProgram]
 code_end:
 
 SECTION program_trail 
