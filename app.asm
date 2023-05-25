@@ -25,14 +25,22 @@ SECTION header vstart=0
     ReadDiskData db '@ReadDiskData'
         times 256-($-ReadDiskData) db 0
 
+    InitTaskSwitch db '@InitTaskSwitch'
+                    times 256-($-InitTaskSwitch) db 0
+
 header_end:
 
 SECTION data vstart=0
     buffer times 1024 db 0 ;缓冲区
     message_1           db 0x0d,0x0a,0x0d,0x0a
-                        db '****************User program is running***********'
+                        db '[User TASK]: Hi! nice to meeet you,'
+                        db 'I am run at CPL='
+                    cpl db 0
                         db 0x0d,0x0a,0
-    message_2           db '  Disk data:',0x0d,0x0a,0
+    message_2           db '[USER TASK]: I needs to have a rest....',0x0d,0x0a,0
+
+    message_3           db '[USER TASK]: I am back again.'
+                        db 'Now,I must exit...',0x0d,0x0a,0
 
 data_end:
 
@@ -43,24 +51,23 @@ start:
     mov eax,ds
     mov fs,eax
 
-    mov eax,[stack_seg]
-    mov ss,eax
-    mov esp,0
-
     mov eax,[data_seg]
     mov ds,eax
 
-    mov ebx,message_1
-    call far[fs:PrintString]
+    mov ax,cs
+    and al,0x03     ;拿到rpl特权
+    or al,0x30
+    mov [cpl],al
 
-    mov eax,100
-    mov ebx,buffer
-    call far [fs:ReadDiskData]
+    mov ebx,message_1
+    call far [fs:PrintString]
 
     mov ebx,message_2
     call far [fs:PrintString]
 
-    mov ebx,buffer
+    call far [fs:InitTaskSwitch]    ;调用门，调用特权代码，切回内核“任务管理器”任务
+
+    mov ebx,message_3
     call far [fs:PrintString]
 
     call far [fs:TerminateProgram]

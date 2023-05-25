@@ -271,7 +271,100 @@ make_gate_descriptor:   ;输入eax函数偏移地址，bx选择子，cx属性;�
     pop ecx
     retf
 
+;------------------------------------------
+initiate_task_switch:       ;主动发起任务切换，输入，输出无
+    pushad
+    push ds
+    push es
 
+    mov eax,core_data_seg_sel
+    mov es,eax
+
+    mov eax,mem_0_4_gb_seg_sel
+    mov ds,eax
+
+    mov eax,[es:tcb_chain]  ;tcb链表
+
+    ;找到状态位忙的任务（当前任务）
+.b0:
+    cmp word [eax+0x04],0xffff
+    cmove esi,eax      ;相等则mov
+    jz .b1
+    mov eax,[eax]   ;状态不为busy，下一个tcb
+    jmp .b0
+
+.b1:
+    mov ebx,[eax]   ;下一个tcb
+    or ebx,ebx      ;最后一个tcb的next是0
+    jz .b2
+    cmp word [ebx+0x04],0x0000
+    cmove edi,ebx   ;相等则转移，找到就绪节点，保存到edi
+    jz .b3
+    mov eax,ebx
+    jmp .b1
+
+.b2 :
+    mov ebx,[es:tcb_chain]
+.b20:
+    cmp word [ebx+0x04],0x0000
+    cmove edi,ebx
+    jz .b3
+    mov ebx,[ebx]
+    or ebx,ebx
+    jz .return  ;到最后一个节点，找不到就绪，结束
+    jmp .b20        
+
+.b3:
+    not word [esi+0x04]     ;当前任务tcb esi。设置任务状态为就绪
+    not word [edi+0x04]     ;下一个任务tcb esi。设置为忙
+
+    jmp far [edi+0x14]      ;下一个任务tss描述符，jmp 任务切换，当前b被清除,现场被保存到tss段中
+
+.return
+    pop es
+    pop ds
+    popad
+
+    retf
+
+;-----------------------------------------------
+terminate_current_task:  ;终结当前任务，把任务tcb中的状态设置为0x3333,然后跳转到其他任务
+
+    mov eax,core_data_seg_sel
+    mov es,eax
+
+    mov eax,mem_0_4_gb_seg_sel
+    mov ds,eax
+
+    mov eax,[es:tcb_chain]
+
+    ;搜索状态位忙的tcb(当前任务)
+.s0:
+    cmp word [eax+0x04],0xffff
+    jz .s1
+    mov eax,[eax]
+    jmp .s0
+
+.s1
+    mov word [eax+0x04],0x3333
+
+    ;遍历，找到就绪任务
+    mov ebx,[es:tcb_chain]
+
+.s2:
+    cmp word [ebx+0x04],0x0000
+    jz .s3
+    mov ebx,[ebx]
+    jmp .s2
+
+
+.s3:
+    not word [ebx+0x04]
+    jmp far [ebx+0x14]
+
+;--------------------------------------------------
+do_task_clean:  ;没有内存管理，无法回收资源，不做任何处理
+    retf
 
 SECTION core_data vstart=0
 
@@ -297,9 +390,14 @@ salt:
     
     salt_4      db '@TerminateProgram'
                 times 256-($-salt_4) db 0
-                dd return_point
-                dw core_code_seg_sel
-    salt_item_len equ $-salt_4
+                dd terminate_current_task
+                dw sys_routine_seg_sel
+
+    salt_5      db '@InitTaskSwitch'
+                times 256-($-salt_5) db 0
+                dd initiate_task_switch
+                dw sys_routine_seg_sel
+    salt_item_len equ $-salt_5
     salt_items  equ ($-salt)/salt_item_len
 
 message_1  db  '  If you seen this message,that means we '
@@ -323,6 +421,17 @@ cpu_brand times 52 db 0
 cpu_brnd1  db 0x0d,0x0a,0x0d,0x0a,0
 
 tcb_chain      dd 0
+
+core_msg1      db 0x0d,0x0a
+                db '[CORE TASK]: I am running at CPL=0.Now,create '
+                db 'user task and switch to it.',0x0d,0x0a,0
+
+core_msg2       db 0x0d,0x0a
+                db '[CORE TASK]: I am working!',0x0d,0x0a,0
+
+core_msg3       db 0x0d,0x0a
+                db '[CORE TASK]: No task to be switched,sleep!'
+                db 0x0d,0x0a,0
 
 SECTION core_code vstart=0
 
@@ -607,11 +716,36 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     mov [es:ecx+102],dx
 
     mov word [es:ecx+100],0
+    mov dword [es:ecx+28],0 ;cr3,页式内存管理不开启
+    ;访问用户程序头部，获取数据填充tss，cs eip ss ds
+    mov ebx,[ebp+11*4]      ;tcb地址
+    mov edi,[es:ebx+0x06]   ;用户程序加载的基地址,就是用户头基地址
+
+    mov edx,[es:edi+0x10]   ;登记程序入口点
+    mov dword [es:ecx+32],edx
+
+    mov dx,[es:edi+0x14]    ;登记代码选择子cs
+    mov [es:ecx+76],dx
+
+    mov dx,[es:edi+0x08]    ;程序堆栈段选择子
+    mov [es:ecx+80],dx
+
+    mov dx,[es:edi+0x04]        ;程序数据段ds选择子,初始是app头部选择子
+    mov [es:ecx+84],dx
+
+    mov word [es:ecx+72],0      ;TSS ES
+    mov word [es:ecx+88],0      ;FS=0
+
+    mov word [es:ecx+92],0      ;GS=0
+
+    pushfd
+    pop dword [es:ecx+36]
+
 
     ;在GDT中登记TSS描述符
     mov eax,[es:esi+0x14]
     movzx ebx,word [es:esi+0x12]
-    mov ecx,0x00408900  ;tss描述符 0特区
+    mov ecx,0x00008900  ;tss描述符 0特区
     call sys_routine_seg_sel:make_seg_descriptor
     call sys_routine_seg_sel:set_up_gdt_descriptor
     mov [es:esi+0x18],cx
@@ -657,7 +791,6 @@ append_to_tcb_link:     ;在TCB链上追加任务控制块;输入ecx是tcb的线
     pop eax
 
     ret
-
 ;----------------------------------------------------------------------------
 start:
 
@@ -717,9 +850,46 @@ start:
     mov ebx,message_5
     call sys_routine_seg_sel:put_string
 
-    ;创建任务控制块tcb
+    ;为内核任务创建任务控制块tcb
     mov ecx,0x46
     call sys_routine_seg_sel:allocate_memory
+    call append_to_tcb_link
+    mov esi,ecx
+
+    ;为内核任务tss分配空间
+    mov ecx,104
+    call sys_routine_seg_sel:allocate_memory
+    mov [es:esi+0x14],ecx   ;在tcb中保存tss基址
+
+    ;设置tss
+    mov word [es:ecx+96],0  ;ldt
+    mov word [es:ecx+102],103   ;103    ;io位图基址。<=tss的界限符，没有io位图
+    mov word [es:ecx],0         ;上一个任务tcb
+    mov word [es:ecx+28],0      ;cr3寄存器，PDBR，不是用页式内存管理
+    mov word [es:ecx+100],0     ;T=0,切换任务时触发异常，用于调试，不开启
+
+    ;创建tss描述符，安装到gdt中
+    mov eax,ecx     ;TSS 基址
+    mov ebx,103     ;104-1,TSS界限
+    mov ecx,0x00008900  ;属性，操作尺度16位？？？，字节粒度，p=1,0特权，系统段，tss描述符
+    call sys_routine_seg_sel:make_seg_descriptor
+    call sys_routine_seg_sel:set_up_gdt_descriptor
+    mov word [es:esi+0x18],cx   ;保存tss选择子在tcb中
+    mov word [es:esi+0x04],0xffff;在tcb中记录任务的状态为忙，0xffff忙，0x0000就绪，0x3333结束
+
+    ;任务寄存器，load内核任务tss，内核任务就是当前任务，
+    ;为当前任务“程序管理器”后补手续
+    ltr cx  ;  gdt中的tss描述符属性b变为1，type由9变为b
+
+    ;现在可以认为“程序管理器中任务正在进行”
+    mov ebx,core_msg1
+    call sys_routine_seg_sel:put_string
+
+
+    ;创建用户任务控制块tcb
+    mov ecx,0x46
+    call sys_routine_seg_sel:allocate_memory
+    mov word [es:ecx+0x04],0    ;就绪任务
     call append_to_tcb_link
 
     push dword 50
@@ -727,41 +897,36 @@ start:
 
     call load_relocate_program
 
-    mov ebx,do_status
+
+    ;可以创建更多的任务
+
+
+.do_switch:
+    ;主动切换到其他任务
+    call sys_routine_seg_sel:initiate_task_switch
+
+    mov ebx,core_msg2
     call sys_routine_seg_sel:put_string
 
-    mov eax,mem_0_4_gb_seg_sel
-    mov ds,eax
+    ;任务又切换回“任务管理器”
+    ;清理结束状态的任务资源tcb tss 描述符
+    call sys_routine_seg_sel:do_task_clean
 
-    ltr [ecx+0x18]
-    lldt [ecx+0x10]
+    ;继续遍历tcb链表
+    mov eax,[tcb_chain]
+.find_ready:
+    cmp word [es:eax+0x04],0x0000       ;任务处于就绪状态，可以被调度
+    jz .do_switch
+    mov eax,[es:eax]    ;下一个tcb
+    or eax,eax
+    jnz .find_ready
 
-    mov eax,[ecx+0x44] ;头部选择子
-    mov ds,eax
-
-;假装从调用门返回，模仿处理器压入返回参数
-    push dword [0x08]   ;堆栈选择子
-    push dword 0        ;esp
-
-    push dword [0x14]   ;用户代码段选择子 特权级别为3 当前级别为0,所以返回被认为是从搞特权级别返回地特权级别
-    push dword [0x10]   ;用户eip
-
-    retf
-
-return_point:
-    mov eax,core_data_seg_sel
-    mov ds,eax
-
-    ; mov eax,core_stack_seg_sel
-    ; mov ss,eax
-    ; mov esp,[esp_pointer]
-
-    ;栈是tss中task的特权0栈,ss是0x24,保存在tss第8个字节，tcb第22个字节，是ldt中的第4个描述符
-
-    mov ebx,message_6
+    ;遍历tcb链，没有就绪任务
+    mov ebx,core_msg3
     call sys_routine_seg_sel:put_string
 
     hlt
+
 
 SECTION core_trail
 core_end:
