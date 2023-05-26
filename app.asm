@@ -39,8 +39,7 @@ SECTION data vstart=0
                         db 0x0d,0x0a,0
     message_2           db '[USER TASK]: I needs to have a rest....',0x0d,0x0a,0
 
-    message_3           db '[USER TASK]: I am back again.'
-                        db 'Now,I must exit...',0x0d,0x0a,0
+    message_3           db '[User TASK]: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB,' ,0x0d,0x0a,0
 
 data_end:
 
@@ -65,10 +64,10 @@ start:
     mov ebx,message_2
     call far [fs:PrintString]
 
-    call far [fs:InitTaskSwitch]    ;调用门，调用特权代码，切回内核“任务管理器”任务
-
+.loop:
     mov ebx,message_3
     call far [fs:PrintString]
+    jmp .loop
 
     call far [fs:TerminateProgram]
 code_end:

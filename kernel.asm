@@ -5,6 +5,7 @@ sys_routine_seg_sel equ 0x28
 core_stack_seg_sel  equ 0x20
 mem_0_4_gb_seg_sel  equ 0x18
 video_ram_seg_sel   equ 0x10
+idt_liner_address   equ 0x1f000 ;中断描述符表基址
 
 
 
@@ -20,6 +21,8 @@ core_entry  dd start        ;段内偏移,0x10
 SECTION sys_routine vstart=0
 put_string:         ;输入ds:ebx 字符串
     push ecx
+    pushfd
+    cli
 .getc:
     mov cl,[ebx]
     or cl,cl
@@ -28,6 +31,7 @@ put_string:         ;输入ds:ebx 字符串
     inc ebx
     jmp .getc
 .exit:
+    popfd
     pop ecx
     retf
 
@@ -285,6 +289,9 @@ initiate_task_switch:       ;主动发起任务切换，输入，输出无
 
     mov eax,[es:tcb_chain]  ;tcb链表
 
+    cmp eax,0
+    jz .return
+
     ;找到状态位忙的任务（当前任务）
 .b0:
     cmp word [eax+0x04],0xffff
@@ -362,6 +369,49 @@ terminate_current_task:  ;终结当前任务，把任务tcb中的状态设置为
     not word [ebx+0x04]
     jmp far [ebx+0x14]
 
+;---------------------------------------------------
+general_interrupt_handler:      ;通用中断处理
+    push eax
+    push ebx
+
+    mov al,0x20
+    out 0xa0,al        ;发送给主片中断完成命令
+    out 0x20,al        ;发送给从片中断完成
+    ; mov ebx,general_interrupt_msg
+    ; call sys_routine_seg_sel:put_string
+    pop ebx
+    pop eax
+
+    iretd
+
+;-----------------------------------------------------
+general_exception_handler:  ;通用异常处理过程
+    mov ebx,excep_msg
+    call sys_routine_seg_sel:put_string
+
+    ; hlt
+    iretd
+
+;--------------------------------------------------
+rtm_0x70_interrupt_handle:  ;试试时钟中断处理过程
+    pushad
+
+    mov al,0x20
+    out 0xa0,al     ;发送给8259A主片中断完成命令
+    out 0x20,al     ;发送给8259A从片
+
+    mov al,0x0c     ;rtc 寄存器C，开放NMI
+    out 0x70,al
+    in al,0x71      ;读出RTC中断类型，清空内容，为了下一次中断能够触发。只设置了更新完成中断，所以不判断类型
+
+    mov ebx,rtc_interrupt_msg
+    call sys_routine_seg_sel:put_string
+
+    ; 请求任务调度
+    call sys_routine_seg_sel:initiate_task_switch
+
+    popad
+    iretd
 ;--------------------------------------------------
 do_task_clean:  ;没有内存管理，无法回收资源，不做任何处理
     retf
@@ -370,6 +420,9 @@ SECTION core_data vstart=0
 
 pgdt        dw 0
             dd 0
+pidt        dw 0
+            dd 0
+
 ram_alloc  dd 0x00100000   ;用户内存起始地址，初始化为1M，向上分配
 
 ;符号地址检索表
@@ -411,6 +464,12 @@ do_status        db  'Done.',0x0d,0x0a,0
 
 message_6  db  0x0d,0x0a,0x0a,0x0a,0x0a
             db 'User program terminated,control returned.',0
+excep_msg   db '********Exception encounted********'
+            db 0x0d,0x0a,0
+
+general_interrupt_msg db "********generatal interrupt********" ,0x0d,0x0a,0
+
+rtc_interrupt_msg db "interrupt after rtc update",0x0d,0x0a,0
 
 core_buf times 2048 db 0
 
@@ -738,8 +797,14 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
 
     mov word [es:ecx+92],0      ;GS=0
 
-    pushfd
-    pop dword [es:ecx+36]
+    pushfd                      ;压栈eflags
+    pop eax 
+    mov ebx,1
+    shl ebx,9
+    or eax,ebx                  ;设置IF允许可屏蔽中断
+
+    mov dword [es:ecx+36],eax       ;eflags
+
 
 
     ;在GDT中登记TSS描述符
@@ -775,7 +840,7 @@ append_to_tcb_link:     ;在TCB链上追加任务控制块;输入ecx是tcb的线
 .searc:
     mov edx,eax
     mov eax,[es:edx+0x00] ;下一个tcb指针
-    xor eax,eax           
+    or eax,eax           
     jnz .searc
 
     mov [es:edx+0x00],ecx   ;加到链表中
@@ -796,6 +861,90 @@ start:
 
     mov ax,core_data_seg_sel
     mov ds,ax
+
+    mov ecx,mem_0_4_gb_seg_sel
+    mov es,ecx
+
+    ;创建中断描述符表idt
+    ;前20个是处理器异常使用的
+    mov eax,general_exception_handler
+    mov bx,sys_routine_seg_sel
+    mov cx,0x8e00           ;中断门，P=1 00 特权 s=0系统段 type 1110 32位中断门
+    call sys_routine_seg_sel:make_gate_descriptor
+
+    mov ebx,idt_liner_address
+    xor esi,esi
+.idt0:
+    mov [es:ebx+esi*8],eax
+    mov [es:ebx+esi*8+4],edx
+    inc esi
+    cmp esi,19
+    jle .idt0           ;安装0-19 异常处理过程
+
+
+    ;安装其余的中断门
+    mov eax,general_interrupt_handler
+    mov bx,sys_routine_seg_sel
+    mov cx,0x8e00           ;中断门
+    call sys_routine_seg_sel:make_gate_descriptor
+
+    mov ebx,idt_liner_address
+.idt1:
+    mov [es:ebx+esi*8],eax
+    mov [es:ebx+esi*8+4],edx
+    inc esi
+    cmp esi,255         ;安装全部256个中断门
+    jle .idt1
+
+;设置实时时钟中断处理
+    mov eax,rtm_0x70_interrupt_handle
+    mov bx,sys_routine_seg_sel
+    mov cx,0x8e00
+    call sys_routine_seg_sel:make_gate_descriptor
+
+    mov ebx,idt_liner_address
+    mov [es:ebx+0x70*8],eax     ;rtc中断号是0x70
+    mov [es:ebx+0x70*8+4],edx
+
+    mov word [pidt],256*8-1 ;中断描述符表的界限
+    mov dword [pidt+2],idt_liner_address
+    lidt [pidt]
+
+    ;设置8259A中断控制器,0x20,0x21是主片的端口
+    mov al,0x11     ;icw1 中断控制字1，控制命令1，设置触发方式 边沿触发?,书上说是电平触发和是级联的形式
+    out 0x20,al
+    mov al,0x20
+    out 0x21,al     ;icw2,0x20说明，硬件向量号偏移32，0->32 1->31
+    mov al,0x04
+    out 0x21,al     ;icw3 0x04,发给主片时，位n置位说明n位连接从片
+    mov al,0x01
+    out 0x21,al      ;icw4 0x01,非自动结束方式，需要向中断控制器写入eoi命令，才能继续下次触发
+
+    ;从片端口是0xa0，0xa1
+    mov al,0x11
+    out 0xa0,al
+    mov al,0x70
+    out 0xa1,al     ;icw2,起始中断向量0x70
+    mov al,0x02
+    out 0xa1,al     ;icw3,发送给从片时，低3位的值，说明级联主片的引脚位置，2引脚连接主片
+    mov al,0x01
+    out 0xa1,al
+
+    ;设置rtc
+    mov al,0x0b
+    or al,0x80      ;阻断NMI
+    out 0x70,al     
+    mov al,0x12
+    out 0x71,al     ;设置B寄存器，禁止周期性中断，开放更新结束后中断，bcd码，24小时制
+
+    in al,0xa1      ;中断控制器从片 IMR 中断屏蔽寄存器
+    and al,0xfe     ;清除位0，此pin连接rtc
+    out 0xa1,al
+
+    mov al,0x0c
+    out 0x70,al
+    in al,0x71      ;读寄存器C，复位未决的中断状态
+    sti             ;EFLAGS 开放可屏蔽中断
 
     mov ebx,message_1
     call sys_routine_seg_sel:put_string
@@ -850,7 +999,9 @@ start:
     mov ebx,message_5
     call sys_routine_seg_sel:put_string
 
+
     ;为内核任务创建任务控制块tcb
+    cli
     mov ecx,0x46
     call sys_routine_seg_sel:allocate_memory
     call append_to_tcb_link
@@ -880,6 +1031,7 @@ start:
     ;任务寄存器，load内核任务tss，内核任务就是当前任务，
     ;为当前任务“程序管理器”后补手续
     ltr cx  ;  gdt中的tss描述符属性b变为1，type由9变为b
+    sti
 
     ;现在可以认为“程序管理器中任务正在进行”
     mov ebx,core_msg1
@@ -887,6 +1039,7 @@ start:
 
 
     ;创建用户任务控制块tcb
+    cli
     mov ecx,0x46
     call sys_routine_seg_sel:allocate_memory
     mov word [es:ecx+0x04],0    ;就绪任务
@@ -896,36 +1049,32 @@ start:
     push ecx
 
     call load_relocate_program
+    sti
 
 
     ;可以创建更多的任务
+    cli
+    mov ecx,0x46
+    call sys_routine_seg_sel:allocate_memory
+    mov word [es:ecx+0x04],0    ;就绪任务
+    call append_to_tcb_link
+
+    push dword 100
+    push ecx
+
+    call load_relocate_program
+    sti
 
 
 .do_switch:
-    ;主动切换到其他任务
-    call sys_routine_seg_sel:initiate_task_switch
-
     mov ebx,core_msg2
     call sys_routine_seg_sel:put_string
-
-    ;任务又切换回“任务管理器”
-    ;清理结束状态的任务资源tcb tss 描述符
-    call sys_routine_seg_sel:do_task_clean
-
-    ;继续遍历tcb链表
-    mov eax,[tcb_chain]
-.find_ready:
-    cmp word [es:eax+0x04],0x0000       ;任务处于就绪状态，可以被调度
-    jz .do_switch
-    mov eax,[es:eax]    ;下一个tcb
-    or eax,eax
-    jnz .find_ready
-
-    ;遍历tcb链，没有就绪任务
-    mov ebx,core_msg3
-    call sys_routine_seg_sel:put_string
+    nop
+    nop
+    nop
 
     hlt
+    jmp .do_switch
 
 
 SECTION core_trail
