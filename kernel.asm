@@ -7,6 +7,8 @@ mem_0_4_gb_seg_sel  equ 0x18
 video_ram_seg_sel   equ 0x10
 idt_liner_address   equ 0x1f000 ;中断描述符表基址
 
+core_lin_alloc_at   equ 0x80100000  ;1M后,内核空间动态内存分配起始地址
+core_lin_tcb_addr   equ 0x8001f800  ;内核任务tcb 虚拟地址
 
 
 core_length dd core_end  ;0x00
@@ -172,27 +174,196 @@ read_hard_disk_0:  ;从主硬盘读取一个逻辑扇区 输入EAX:为硬盘逻�
     pop ecx
     pop eax
     retf
-
-allocate_memory: ;分配内存，输入ecx分配的字节，输出ecx 起始线性地址
-    push ds
-    push eax
+;----------------------------------------------------------------
+allocate_a_4k_page:    ;分配一个从空闲物理内存中分配一个4k页，输出eax 物理页地址
     push ebx
+    push ecx
+    push edx
+    push ds
 
     mov eax,core_data_seg_sel
     mov ds,eax
 
-    mov eax,[ram_alloc]
-    add eax,ecx
+    xor eax,eax
+.b1:
+    bts [page_bit_map],eax      ;test and swap bit,page为bit流的起始地址，eax为bit的位置，当前bit置位，把原来的值给cf
+    jnc .b2                     ;如果上一条命令，bit的原来的值是0，对应的页空闲，cf被置零，nc跳转
+    inc eax
+    cmp eax,page_map_len*8
+    jl .b1
 
-    mov ecx,[ram_alloc]
+    mov ebx,message_3
+    call sys_routine_seg_sel:put_string
+    hlt                         ;没有可分配的页
+.b2:
+    shl eax,12
 
-    ;4字节对齐下一次分配的起始地址
+    pop ds
+    pop edx
+    pop ecx
+    pop ebx
+
+    ret
+
+;----------------------------------------------------------------
+alloc_inst_a_page:      ;为虚拟内存页分配一个物理页，建立映射关系；输入ebx虚拟页地址
+    push eax
+    push ebx
+    push ecx
+    push esi
+    push ds
+
+    mov eax,mem_0_4_gb_seg_sel
+    mov ds,eax
+
+    ;检查虚拟地址是否已经安装页表
+    mov esi,ebx
+    and esi,0xffc00000  ;高10位页目录内索引
+    shr esi,20          ;页目录内索引乘4是这项在页目录这页内的偏移
+    or esi,0xffffff000  ;高20位为1，低12位为页内偏移，页目录最高项内的页地址就是此页目录地址，把页目录当页表，在当页访问
+
+    test dword [esi],0x00000001 ;P位，页表是否存在
+    jnz .b1             ;存在
+
+    ;创建并安装页表
+    call allocate_a_4k_page ;分配一页做页表
+    or eax,0x00000007   ;111 user RW P
+    mov [esi],eax
+
+    ;清空当前页表
+    mov eax,ebx
+    and eax,0xffc00000  ;保存高10位
+    shr eax,10          ;高10位右移10位，当做页表内索引，把也目录项当页表
+    or eax,0xffc00000   ;高10位置一，也目录项是页表，页表作页访问
+    mov ecx,1024        ;页表内有
+.cls0:
+    mov dword [es:eax],0x00000000
+    add eax,4
+    loop .cls0
+
+.b1:
+    ;检查虚拟内存对应的页表内的物理页是否存在
+    mov esi,ebx
+    and esi,0xfffff000
+    shr esi,10       ;页目录当页表，页表当页,页表索引*4，是页表,页内内偏移
+    or esi,0xffc00000   ;高10位置位，页表就是页目录项
+
+    test dword [esi],0x00000001
+    jnz .b2           ;存在页
+
+    ;创建并安装页
+    call allocate_a_4k_page
+    or eax,0x00000007
+    mov [esi],eax
+
+.b2:
+    pop ds
+    pop esi
+    pop ecx
+    pop ebx
+    pop eax
+    retf
+;---------------------------------------------------------------
+create_copy_cur_pdir:       ;创建新页目录，并复制内核的页目录，输出页目录的物理地址
+    push ds
+    push es
+    push esi
+    push edi
+    push ebx
+    push ecx
+
+    mov ebx,mem_0_4_gb_seg_sel
+    mov ds,ebx
+    mov es,ebx
+
+    call allocate_a_4k_page
     mov ebx,eax
-    add ebx,0xfffffffc
-    add ebx,4
-    test eax,0x00000003
-    cmovnz eax,ebx
-    mov [ram_alloc],eax
+    or ebx,0x00000007
+    mov [0xfffffff8],ebx    ;把当前页目录当页表，当页，倒数第二项在页内的偏移，新分配的页登记在页目录的倒数第2项
+
+    invlpg [0xfffffff8]     ;刷新tlb一项。
+
+    mov esi,0xfffff000      ;当前页目录的虚拟页地址
+    mov edi,0xffffe000      ;新分配的页目录的虚拟页地址
+    mov ecx,1024
+    cld
+    repe movsd
+
+    pop ecx
+    pop ebx
+    pop edi
+    pop esi
+    pop es
+    pop ds
+    retf
+;----------------------------------------------------------------
+task_allock_memory:     ;在指定任务的虚拟内存空间中分配内存；输入ebx，指定task的tcb，ecx希望分配的字节数；输出ecx分配内存的线性地址
+    push eax
+    push ds
+    push ebx
+
+    ;获得本次内存分配的起始线性地址
+    mov ax,mem_0_4_gb_seg_sel
+    mov ds,ax
+
+    mov ebx,[ebx+0x46]
+    mov eax,ebx
+    add ecx,ebx         ;本次分配
+    push ecx
+
+    ;为内存分配页
+    and ebx,0xfffff000
+    and ecx,0xfffff000
+.next:
+    call sys_routine_seg_sel:alloc_inst_a_page
+
+    add ebx,0x1000
+    cmp ebx,ecx
+    jle .next
+
+    ;将用于下一次分配的线性地址强制按4字节对齐
+    pop ecx
+
+    test ecx,0x00000003
+    jz .algn
+    add ecx,4
+    and ecx,0xfffffffc
+
+.algn:
+    pop ebx
+    mov [ebx+0x46],ecx  ;保存空闲虚拟内存的起始地址到tcb
+    mov ecx,eax
+
+    pop ds
+    pop eax
+    retf
+
+;---------------------------------------------------------------
+allocate_memory: ;从当前任务的虚拟地址空间中分配内存；输入ecx希望分配的字节数；输出ecx 起始线性地址
+    push ds
+    push eax
+    push ebx
+
+    ; 得到tcb链表首地址
+    mov eax,core_data_seg_sel
+    mov ds,eax
+
+    mov eax,[tcb_chain]
+
+    mov ebx,mem_0_4_gb_seg_sel
+    mov ds,ebx
+
+    ;搜索状态为busy的task，
+.s0:
+    cmp word [eax+0x04],0xffff
+    jz .s1
+    mov eax,[eax]
+    jmp .s0
+
+    ;开始分配内存
+.s1
+    mov ebx,eax
+    call sys_routine_seg_sel:task_allock_memory
 
     pop ebx
     pop eax
@@ -327,7 +498,7 @@ initiate_task_switch:       ;主动发起任务切换，输入，输出无
 
     jmp far [edi+0x14]      ;下一个任务tss描述符，jmp 任务切换，当前b被清除,现场被保存到tss段中
 
-.return
+.return:
     pop es
     pop ds
     popad
@@ -423,6 +594,16 @@ pgdt        dw 0
 pidt        dw 0
             dd 0
 
+page_bit_map    db  0xff,0xff,0xff,0xff,0xff,0xff,0x55,0x55    ;2M内存的位图
+                db  0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+                db  0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+                db  0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+                db  0x55,0x55,0x55,0x55,0x55,0x55,0x55,0x55
+                db  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+                db  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+                db  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+page_map_len    equ $-page_bit_map
+
 ram_alloc  dd 0x00100000   ;用户内存起始地址，初始化为1M，向上分配
 
 ;符号地址检索表
@@ -458,6 +639,7 @@ message_1  db  '  If you seen this message,that means we '
            db  'core is loaded,and the video display '
            db  'routine works perfectly.',0x0d,0x0a,0
 message_2  db  '    System wide CALL-GATE mounted.',0x0d,0x0a,0
+message_3  db  '**************No more pages************',0x0d,0x0a,0
 message_5  db  ' Loading user program...',0
 
 do_status        db  'Done.',0x0d,0x0a,0
@@ -536,13 +718,26 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     mov ecx,mem_0_4_gb_seg_sel
     mov es,ecx
 
+    ;清空当前页目录的前半部分，就是低2G的内存空间，用户虚拟空间
+    mov ebx,0xfffff000
+    xor esi,esi
+.clsp:
+    mov dword [es:ebx+esi*4],0x00000000
+    inc esi
+    cmp esi,512
+    jl .clsp
+
+    mov ebx,cr3
+    mov cr3,ebx     ;刷新tlb
+
     mov esi,[ebp+11*4]  ;取出push的 tcb 地址，near call ,eip 4个字节，pushad 8*4个字节 push ds 4个字节 push es4个字节
 
     ;创建20个LDT
     mov ecx,160
-    call sys_routine_seg_sel:allocate_memory
+    mov ebx,esi         ;通过ebx传递tcb给task_allock_memory
+    call sys_routine_seg_sel:task_allock_memory
     mov [es:esi+0x0c],ecx   ;记录任务的ldt到tcb
-    mov [es:esi+0x0a],word 0xffff ;8K个描述符？
+    mov [es:esi+0x0a],word 0xffff ;描述符表界限，+1是下一个描述符起始位置
 
 
     mov eax,core_data_seg_sel
@@ -561,7 +756,8 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     cmovnz eax,ebx     ;eax最后9位，不全为零，不是512的整数倍，向上取整数倍
 
     mov ecx,eax
-    call sys_routine_seg_sel:allocate_memory
+    mov ebx,esi
+    call sys_routine_seg_sel:task_allock_memory
     mov [es:esi+0x06],ecx
 
     mov ebx,ecx
@@ -625,7 +821,8 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     mov eax,4096
     mul dword [edi+0x0c]
     mov ecx,eax
-    call sys_routine_seg_sel:allocate_memory
+    mov ebx,esi
+    call sys_routine_seg_sel:task_allock_memory
     add eax,ecx ;向下扩展的粒度为4kb的段,有n个4k大小，基址+(2^20-x)*4k 为下限ecx,或者基址+2^32 = ecx + n*4k，所以基址=ecx+n*4k
     mov ecx,0x00c0f600
     call sys_routine_seg_sel:make_seg_descriptor
@@ -687,7 +884,8 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     mov eax,ecx
     mov [es:esi+0x1a],ecx  ;tcb,0特权 栈长度
     shr dword [es:esi+0x1a],12    ;0特权级 栈长度，4k单位
-    call sys_routine_seg_sel:allocate_memory
+    mov ebx,esi
+    call sys_routine_seg_sel:task_allock_memory
     add eax,ecx      ;向下扩展的栈，上届为其基址
     mov [es:esi+0x1e],eax
     mov ebx,0xfffe  ;1个4k 段描述符的界限
@@ -703,7 +901,8 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     mov eax,ecx
     mov [es:esi+0x28],ecx
     shr dword [es:esi+0x28],12
-    call sys_routine_seg_sel:allocate_memory
+    mov ebx,esi
+    call sys_routine_seg_sel:task_allock_memory
     add eax,ecx
     mov [es:esi+0x2c],eax
     mov ebx,0xfffe
@@ -720,7 +919,8 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     mov eax,ecx
     mov [es:esi+0x36],ecx
     shr dword [es:esi+0x36],12
-    call sys_routine_seg_sel:allocate_memory
+    mov ebx,esi
+    call sys_routine_seg_sel:task_allock_memory
     add eax,ecx
     mov [es:esi+0x3a],ecx
     mov ebx,0xffffe
@@ -743,8 +943,8 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     ;创建用户程序tss
     mov ecx,104             ;tss大小
     mov [es:esi+0x12],cx
-    dec word [es:esi+0x12]  ;tss界限
-    call sys_routine_seg_sel:allocate_memory
+    dec word [es:esi+0x12]  ;tss界限 
+    call sys_routine_seg_sel:allocate_memory    ;tss被特权用户访问，所以和tcb一样，在内核的地址空间内分配，即高2G
     mov [es:esi+0x14],ecx   ;登记tss基地址到tcb
 
     ;登记基本的tss表格内容
@@ -815,6 +1015,11 @@ load_relocate_program:      ;push 起始逻辑扇区号，push tcb
     call sys_routine_seg_sel:set_up_gdt_descriptor
     mov [es:esi+0x18],cx
 
+    ;创建用户任务的页目录
+    call sys_routine_seg_sel:create_copy_cur_pdir
+    mov ebx,[es:esi+0x14]
+    mov dword [es:ebx+28],eax       ;填写tss的cr3域 pdbr.
+
     pop es
     pop ds
 
@@ -826,6 +1031,8 @@ append_to_tcb_link:     ;在TCB链上追加任务控制块;输入ecx是tcb的线
     push edx
     push ds
     push es
+    pushfd
+    cli
 
     mov eax,core_data_seg_sel
     mov ds,eax
@@ -850,6 +1057,7 @@ append_to_tcb_link:     ;在TCB链上追加任务控制块;输入ecx是tcb的线
     mov [tcb_chain],ecx
 
 .retpc
+    popfd
     pop es
     pop ds
     pop edx
@@ -977,11 +1185,94 @@ start:
     mov ebx,cpu_brnd1
     call sys_routine_seg_sel:put_string
 
+    ;准备打开分页机制
+    ;创建系统内核的也目录表pdt
+    ;页目录表清零
+    mov ecx,1024
+    mov ebx,0x00020000   ;页目录的基地址
+    xor esi,esi
+.b1:
+    mov dword [es:ebx+esi],0x00000000   ;页目录表项清零
+    add esi,4
+    loop .b1
+
+    mov dword [es:ebx+4092],0x00020003
+
+    ;在页目录内创建第0个页表项，页表地址0x21000
+    mov dword [es:ebx+0],0x00021003
+
+    ;初始化页表，页表地址0x21000
+    mov ebx,0x00021000      ;页表的物理地址
+    xor eax,eax
+    xor esi,esi
+.b2:
+    mov edx,eax
+    or edx,0x00000003
+    mov [es:ebx+esi*4],edx              ;线性地址映射为物理地址，线性地址=物理地址
+    add eax,0x1000
+    inc esi
+    cmp esi,256                         ;只映射256页，共1M
+    jl .b2
+
+.b3:
+    mov dword [es:ebx+esi*4],0x00000000 ;页表项没有对应的页
+    inc esi
+    cmp esi,1024
+    jl .b3
+
+    ;CR3寄存器指向页目录物理地址
+    mov eax,0x00020000
+    mov cr3,eax
+    cli
+
+    ;CR0 最高位置位，开启页管理
+    mov eax,cr0
+    or eax,0x80000000
+    mov cr0,eax
+
+    ;2G/2G 分配，32位4G地址空间，内核使用高2G(0x08000000起始),设置对应的页目录项指向页表
+    ;把页目录项当做页表，把页表当做页，页目录的最高项存放页目录的地址，高20位为1，低12位页内偏移就是高10位页目录索引*4，所以
+    ;0x80000000>>20 ||0xfffff000
+    mov dword [es:0xfffff800],0x00021003   ;高2G线性地址-0x80000000=物理地址，现在只分配了1M空间
+
+    ;将GDT中的段的基地址都映射位高位，基地址加0x80000000,只需把段基地址最高位置位，基地址的最高位在段描述符高4位的最高位
+    sgdt [pgdt]
+
+    mov ebx,[pgdt+2]
+
+    or dword [es:ebx+0x08+4],0x80000000         ;第一个段描述符
+    or dword [es:ebx+0x10+4],0x80000000 
+    or dword [es:ebx+0x20+4],0x80000000 
+    or dword [es:ebx+0x28+4],0x80000000 
+    or dword [es:ebx+0x30+4],0x80000000 
+    or dword [es:ebx+0x38+4],0x80000000         ;gdt总共安装了8个描述符，0x00是不可用的，0x18是0-4G段，需要从0起始。0x08是mbr，实际上不会在使用，也可以不写
+
+    or dword [pgdt+2],0x80000000    ;gdtr基地址也用高2G空间的线性地址虚拟地址
+    lgdt [pgdt]
+
+    ;修改IDTR，将idt基址映射到高2G地址空间
+    sidt [pidt]
+    or dword [pidt+2],0x80000000
+    lidt [pidt]
+
+    jmp core_code_seg_sel:flush      ;刷新段地址寄存器cs，代码段基址在高2G空间，经页目录项和页表映射到物理内存
+flush:
+    mov eax,core_stack_seg_sel
+    mov ss,eax
+
+    mov eax,core_data_seg_sel
+    mov ds,eax                      ;刷新段选择子，线性地址在高2G，是虚拟内存，还是映射到原来的物理内存，没有发生改变，只是多了一个映射过程
+
+    sti
+
+    mov ebx,message_1
+    call sys_routine_seg_sel:put_string
+
     ;安装系统服务调用门
     mov edi,salt
     mov ecx,salt_items
 
-.b3:
+.g0:
     push ecx
     mov eax,[edi+256]
     mov bx, [edi+260]
@@ -991,7 +1282,7 @@ start:
     mov [edi+260],cx
     add edi,salt_item_len
     pop ecx
-    loop .b3
+    loop .g0
 
     ;调用门测试
     mov ebx,message_2
@@ -1001,9 +1292,9 @@ start:
 
 
     ;为内核任务创建任务控制块tcb
-    cli
-    mov ecx,0x46
-    call sys_routine_seg_sel:allocate_memory
+    mov ecx,core_lin_tcb_addr
+    mov word [es:ecx+0x04],0xffff   ;设置内核任务状态为busy，内核任务是current task
+    mov dword [es:ecx+0x46],core_lin_alloc_at   ;登记内核任务空闲虚拟空间起始地址
     call append_to_tcb_link
     mov esi,ecx
 
@@ -1013,20 +1304,20 @@ start:
     mov [es:esi+0x14],ecx   ;在tcb中保存tss基址
 
     ;设置tss
-    mov word [es:ecx+96],0  ;ldt
+    mov word [es:ecx+96],0  ;ldt选择子
     mov word [es:ecx+102],103   ;103    ;io位图基址。<=tss的界限符，没有io位图
-    mov word [es:ecx],0         ;上一个任务tcb
-    mov word [es:ecx+28],0      ;cr3寄存器，PDBR，不是用页式内存管理
+    mov word [es:ecx],0         ;上一个任务tss选择子
+    mov eax,cr3
+    mov dword [es:ecx+28],eax      ;cr3寄存器，PDBR
     mov word [es:ecx+100],0     ;T=0,切换任务时触发异常，用于调试，不开启
 
     ;创建tss描述符，安装到gdt中
     mov eax,ecx     ;TSS 基址
     mov ebx,103     ;104-1,TSS界限
-    mov ecx,0x00008900  ;属性，操作尺度16位？？？，字节粒度，p=1,0特权，系统段，tss描述符
+    mov ecx,0x00008900  ;属性，字节粒度，p=1,0特权，系统段，tss描述符
     call sys_routine_seg_sel:make_seg_descriptor
     call sys_routine_seg_sel:set_up_gdt_descriptor
     mov word [es:esi+0x18],cx   ;保存tss选择子在tcb中
-    mov word [es:esi+0x04],0xffff;在tcb中记录任务的状态为忙，0xffff忙，0x0000就绪，0x3333结束
 
     ;任务寄存器，load内核任务tss，内核任务就是当前任务，
     ;为当前任务“程序管理器”后补手续
@@ -1039,24 +1330,23 @@ start:
 
 
     ;创建用户任务控制块tcb
-    cli
-    mov ecx,0x46
-    call sys_routine_seg_sel:allocate_memory
+    mov ecx,0x4a
+    call sys_routine_seg_sel:allocate_memory    ;从当前任务（内核任务）的虚拟地址空间中分配内存，返回的虚拟地址是在高端的
     mov word [es:ecx+0x04],0    ;就绪任务
+    mov dword [es:ecx+0x46],0   ;用户任务的虚拟地址空间在低端，所以从空闲内存从0起始
     call append_to_tcb_link
 
     push dword 50
     push ecx
 
     call load_relocate_program
-    sti
-
 
     ;可以创建更多的任务
     cli
-    mov ecx,0x46
+    mov ecx,0x4a
     call sys_routine_seg_sel:allocate_memory
     mov word [es:ecx+0x04],0    ;就绪任务
+    mov dword [es:ecx+0x46],0
     call append_to_tcb_link
 
     push dword 100
