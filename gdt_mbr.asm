@@ -1,57 +1,44 @@
 core_base_address equ 0x00040000  ;内核加载地址,第252k
 core_start_sector equ 0x00000001  ;内核在硬盘上第1扇区
+
+;======================================================
+SECTION mbr vstart=0x00007c00
 mov ax,cs
 mov ss,ax
 mov sp,0x7c00
 
-;gdt_base是汇编地址，加上段起始内存地址则得到她的内存段偏移地址
-mov ax,[cs:gdt_base+0x7c00]
-mov dx,[cs:gdt_base+0x7c00+2]
+;gdt_base是相对段起始的汇编地址，mbr被加载到了0x7c00,所以即是内存地址
+mov eax,[gdt_base]
+xor edx,edx
 
-mov bx,16
-div bx
-push ds
+mov ebx,16
+div ebx
+
 mov ds,ax
 
-mov bx,dx
-mov dword [bx],0x00   
-mov dword [bx+4],0x00 ;0段描述符为null
+mov ebx,edx
+mov dword [ebx],0x00   
+mov dword [ebx+4],0x00 ;0段描述符为null
 
-;第一个段描述符，代码段
-add bx,8
-mov dword [bx],0x7c0001ff
-mov dword [bx+4],0x00409800 ;段基址0x7c00,界限0x1ff,1字节粒度，32位操作尺度，段存在，0特权级别，代码段或数据段，只执行。
+;1段描述符，保护模式下的代码描述符，特权级别0,基址0，界限0xfffff,4k粒度
+mov dword [ebx+0x08],0x0000ffff
+mov dword [ebx+0x0c],0x00cf9800
 
-;第2个段描述符
-mov ax,3999    ;段界限,显存段界限
-add bx,8
-mov word [bx],ax ;15-0
+;2段描述符，保护模式下的数据段和堆栈描述符，特权级别0，基地址0，界限0xfffff,4k粒度
+mov dword [ebx+0x10],0x0000ffff
+mov dword [ebx+0x14],0x00cf9200
 
-;显存段 0xb800 0xb8000
-mov word [bx+2],0x8000
+;3段描述符，保护模式下的代码描述符，特权级3，基址0，界限0xfffff，4k粒度
+mov dword [ebx+0x18],0x0000ffff
+mov dword [ebx+0x1c],0x00cff800
 
-mov byte [bx+4],0x0b
-xor al,al
-or al,0x02 ;低4位是type xewa ,读写
-or al,10010000b ;高四位设置段存在 特权0 数据段
-mov byte [bx+5],al
-xor al,al  ;低4位是段界限 16-19
-or al,01000000b ;高四位GBL(AVL)设置 粒度为字节,32位栈偏移寄存器esp,
-mov byte [bx+6],al
-mov byte [bx+7],0 ;段基址的24-31
+;4段描述符，保护模式下的数据段和堆栈段，特权为3，基地址0，界限0xfffff，4K粒度
+mov dword [ebx+0x20],0x0000ffff
+mov dword [ebx+0x24],0x00cff200
 
-;3数据段 0-4G
-add bx,8
-mov dword [bx],0x0000ffff ;基地址0,界限fffff，32位尺寸，可读写，向下扩展数据段
-mov dword [bx+4],0x00cf9200
 
-;栈段4 ss = 4<<3
-add bx,8
-mov dword [bx],0x7c00fffe ;基地址0x7c00，界限0xffffe,4K,读写向下段，32位操作操作尺寸。下届是0x7c00+0xffffe*4k，上界是0x7c00+0xffffffff.下届是0x7c00+(0xffffffff-0xfffe*4k)=0x7c00+0xffffe000
-mov dword [bx+4],0x00cf9600
-
-mov word [cs:gdt_size+0x7c00],39 ;gdtr 48位，高32位是gdt表起始地址，低16位是gdt边界。两个描述符，5*8-1
-lgdt [cs:0x7c00+gdt_size]
+mov word [cs:gdt_size],39 ;gdtr 48位，高32位是gdt表起始地址，低16位是gdt边界。两个描述符，5*8-1
+lgdt [cs:gdt_size]
 
 ; 打开20号地址线
 in al,0x92
@@ -67,12 +54,13 @@ mov cr0,eax  ;使能保护模式;此时代码还使用实模式cs生成的在告
 jmp dword 0x0008:flush
 [bits 32]
 flush:
-    mov ax,32
+    mov ax,0x10 ;使用2#段
     mov ss,ax
-    xor esp,esp ;向下增长的栈段
-
-    mov eax,0x0018 ;数据段3
     mov ds,ax
+    mov es,ax
+    mov fs,ax
+    mov gs,ax
+    mov esp,0x7c00
 
     mov edi,core_base_address
     mov eax,core_start_sector
@@ -101,47 +89,47 @@ flush:
     loop @2
 
 setup:
-    mov esi,[0x7c00+gdt_base]        ;gdt
+    ;建立页目录和页表，使用分页机制
+    mov ebx,0x00020000  ;页目录pdt物理地址
 
-    ;建立公用例程段描述符
-    mov eax,[edi+0x04]  ;公用例程段汇编地址
-    mov ebx,[edi+0x08]  ;core_data_seg 汇编地址
-    sub ebx,eax
-    dec ebx             ;公用例程段界限
-    add eax,edi         ;公用例程段内存地址
-    mov ecx,0x00409800  ;32位尺度，p存在，0特权级别，s数据段或代码段,只执行代码段
-    call make_gdt_descriptor
-    mov [esi+5*8],eax   ;第5个描述符
-    mov [esi+5*8+4],edx
+    ;页目录的最后一项指向自己
+    mov dword [ebx+4092],0x00020003
 
-    ;建立内核数据段描述符
-    mov eax,[edi+0x08]
-    mov ebx,[edi+0x0c]
-    sub ebx,eax         ;段长度
-    dec ebx
-    add eax,edi
-    mov ecx,0x00409200
-    call make_gdt_descriptor
-    mov [esi+6*8],eax
-    mov [esi+6*8+4],edx
+    mov edx,0x00021003  ;页表,一个页表可映射4M空间
+    mov dword [ebx],edx
 
-    ;建立core_code代码段描述符
-    mov eax,[edi+0x0c]
-    mov ebx,[edi]
-    sub ebx,eax         ;core_code长度
-    dec ebx             ;界限
-    add eax,edi
-    mov ecx,0x00409800
-    call make_gdt_descriptor
-    mov [esi+7*8],eax
-    mov [esi+7*8+4],edx
+    ;高2G虚拟空间映射
+    mov [ebx+0x800],edx
 
-    mov word [0x7c00+gdt_size],8*8-1
-    lgdt [0x7c00+gdt_size]
-    call far [edi+0x10]
-idle:
-    hlt
-    jmp idle
+    ;初始化页表，线性映射
+    mov ebx,0x00021000
+    xor eax,eax
+    xor esi,esi
+.b1:
+    mov edx,eax
+    or edx,0x00000003
+    mov [ebx+esi*4],edx
+    add eax,0x1000  ;下一页
+    inc esi
+    cmp esi,256     ;只映射低1M
+    jl .b1
+
+    ;cr3设置页目录地址
+    mov eax,0x00020000
+    mov cr3,eax
+
+    ;将gdt的线性地址同样改到高2G空间
+    sgdt [gdt_size]
+    add dword [gdt_base],0x80000000
+    lgdt [gdt_size]
+
+    mov eax,cr0
+    or eax,0x80000000
+    mov cr0,eax         ;开启页管理
+
+    add esp,0x80000000  ;esp也在高端2G
+
+    jmp [0x80040004]
 
 read_hard_disk_0:  ;从主硬盘读取一个逻辑扇区 输入EAX:为硬盘逻辑扇区，DS:EBX内存缓冲区，返回：EBX=EBX+512
     push eax
@@ -215,7 +203,7 @@ make_gdt_descriptor:       ;输入EAX 线性地址，段的基地址，EBX 界�
 
 
 gdt_size: dw 0
-gdt_base: dd 0x00007e00
+gdt_base: dd 0x00008000
 
 times 510-($-$$) db 0
 db 0x55,0xaa
