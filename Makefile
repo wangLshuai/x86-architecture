@@ -26,4 +26,4 @@ app1.bin:app1.asm
 
 .PHONY:clean
 clean:
-	rm -rf *.bin *.o,*.lst
+	rm -rf *.bin *.o *.lst
