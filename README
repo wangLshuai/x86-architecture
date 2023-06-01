@@ -1,0 +1,21 @@
+## 学习《x86汇编语言：从实模式到保护模式》
+
+### 依赖 nasm qemu
+```shell
+sudo apt install nasm qemu-system-x86
+```
+
+### build
+```shell
+make image
+```
+
+### run
+```shell
+make run
+```
+
+### debug
+```shell
+make debug
+```
